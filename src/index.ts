@@ -62,7 +62,7 @@ export class Compiler {
   }
   /** Synchronous CPU work. Use a worker thread for latency-sensitive Node servers. */
   compile(request: CompileRequest): CompiledQuery {
-    const encoded = JSON.stringify(request);
+    const encoded = encodeRequest(request);
     if (!encoded || encoded.includes('\u0000')) throw new Error('Request cannot contain NUL');
     const pointer = this.compileNative(encoded);
     if (!pointer) throw new Error('Native compiler returned a null response');
@@ -93,4 +93,32 @@ function defaultLibrary(): string {
 /** Ensures early cancellation and exceptions release the caller-provided result lease. */
 export async function* batches(result: ArrowResult): AsyncGenerator<RecordBatch> {
   try { yield* result; } finally { await result.close(); }
+}
+
+/** JSON numbers are emitted directly for bigint so signed int64 values reach Rust intact.
+ * Reject rounded Numbers instead of compiling a different parameter value. */
+function encodeRequest(value: unknown, ancestors = new Set<object>()): string {
+  if (value === null) return 'null';
+  if (typeof value === 'bigint') {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n)
+      throw new RangeError('Integer parameter exceeds signed 64-bit range');
+    return value.toString();
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('Numbers must be finite');
+    if (Number.isInteger(value) && !Number.isSafeInteger(value))
+      throw new RangeError('Unsafe integer Number; pass an exact bigint instead');
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value !== 'object') throw new TypeError('Request must contain JSON values or signed int64 bigint');
+  if (ancestors.has(value)) throw new TypeError('Cyclic request');
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) return '[' + Array.from(value, item => encodeRequest(item, ancestors)).join(',') + ']';
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) throw new TypeError('Request objects must be plain objects');
+    return '{' + Object.entries(value).filter(([, item]) => item !== undefined)
+      .map(([key, item]) => JSON.stringify(key) + ':' + encodeRequest(item, ancestors)).join(',') + '}';
+  } finally { ancestors.delete(value); }
 }

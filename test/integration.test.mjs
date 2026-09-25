@@ -37,3 +37,26 @@ test('early stop releases Arrow lease and permits connection reuse', async()=>{
     for await(const batch of batches(again)) assert.equal(batch.getChild('n').get(0),10000n);
   } finally {connection.close();db.reset();}
 });
+
+test('integer parameters preserve signed int64 exactly through compiler and DuckDB Arrow', async () => {
+  const db = await openDatabase(); const connection = db.connect();
+  try {
+    const compiler = new Compiler();
+    for (const n of [9007199254740993n, -9007199254740993n, 9223372036854775807n, -9223372036854775808n]) {
+      const plan = compiler.compile({...request, query: 'RETURN $n AS n', parameters: {n}});
+      assert.equal(connection.query(plan.sql).getChild('n').get(0), n);
+    }
+    const nested = compiler.compile({...request, query: 'RETURN $values[0] AS n', parameters: {values: [9007199254740993n]}});
+    assert.equal(connection.query(nested.sql).getChild('n').get(0), 9007199254740993n);
+    for (const n of [9007199254740992, -9007199254740992, NaN, Infinity, -Infinity, 9223372036854775808n, -9223372036854775809n]) {
+      assert.throws(() => compiler.compile({...request, query: 'RETURN $n AS n', parameters: {n}}), /Unsafe integer|finite|64-bit range/);
+    }
+    const text = '9007199254740993\"; DROP TABLE people; --';
+    const literal = compiler.compile({...request, query: 'RETURN $n AS n', parameters: {n: text}});
+    assert.equal(connection.query(literal.sql).getChild('n').get(0), text);
+    for (const n of [42, 0.125, Number.MAX_SAFE_INTEGER]) {
+      const plan = compiler.compile({...request, query: 'RETURN $n AS n', parameters: {n}});
+      assert.equal(connection.query(`SELECT CAST(n AS DOUBLE) AS n FROM (${plan.sql})`).getChild('n').get(0), n);
+    }
+  } finally { connection.close(); db.reset(); }
+});
