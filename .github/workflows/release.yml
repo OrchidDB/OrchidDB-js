@@ -1,0 +1,79 @@
+name: Build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_npm:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: .native-build/orchiddb-native
+      - run: npm ci
+      - run: ./scripts/build-native.sh
+      - run: npm test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.os }}
+          path: native/
+  package:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: native/
+          merge-multiple: true
+      - run: npm ci
+      - run: npm test
+      - run: npm pack
+      - uses: actions/upload-artifact@v4
+        with: {name: npm-package, path: '*.tgz'}
+  github-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-22.04
+    permissions: {contents: write}
+    steps:
+      - uses: actions/checkout@v4
+      - run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+      - uses: actions/download-artifact@v4
+        with: {name: npm-package, path: packages}
+      - run: gh release create "$GITHUB_REF_NAME" packages/*.tgz --generate-notes
+        env: {GH_TOKEN: '${{ github.token }}'}
+  npm-publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish_npm && startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-22.04
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22', registry-url: 'https://registry.npmjs.org'}
+      - run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+      - uses: actions/download-artifact@v4
+        with: {name: npm-package, path: packages}
+      - run: npm publish packages/*.tgz --access public
+        env: {NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}'}
