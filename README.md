@@ -3,14 +3,24 @@
 Compile Cypher, Gremlin text, or SPARQL to SQL. Execute on your own database and consume Apache Arrow record batches. No database is bundled; no result rows pass through the Rust compiler.
 
 ```sh
-npm install @orchiddb/client apache-arrow
+npm install @orchiddb/client@0.1.0 apache-arrow@17
 ```
 
 For SQL compilation alone, install only `@orchiddb/client`. Apache Arrow is an
 optional peer dependency: install it when using the Arrow interfaces (including
 the TypeScript declarations). Database drivers remain application dependencies.
 
-The first release is not published yet. For a source checkout run `npm ci && npm run build` and set `ORCHIDDB_NATIVE_LIBRARY` to the compiler shared library from [OrchidDB-native](https://github.com/OrchidDB/OrchidDB-native). Release npm archives bundle the pinned native compiler for Linux x64 and macOS arm64/x64. There is no runtime download. Node 20+; this package is not a browser/Wasm compiler.
+Version 0.1.0 is published on npm and bundles the macOS ARM64 compiler. No native library path or Rust build is required on that platform. Node 20+; this package is not a browser/Wasm compiler.
+
+Run the example against published packages:
+
+```sh
+cd examples
+npm install
+npm start
+```
+
+The example supplies its own DuckDB-Wasm and Arrow dependencies and checks graph values, nulls and connection reuse.
 
 ```ts
 import { Compiler, batches } from '@orchiddb/client';

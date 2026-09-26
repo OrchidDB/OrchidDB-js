@@ -1,7 +1,7 @@
+import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import duckdb from '@duckdb/duckdb-wasm/blocking';
-import { Compiler, batches } from '../dist/index.js';
 const require = createRequire(import.meta.url);
 export const request = {
   version: 1, dialect: 'duckdb', language: 'cypher',
@@ -47,13 +47,20 @@ export function arrowEngine(connection) {
   };
 }
 export async function main() {
+  const { Compiler, batches } = await import('@orchiddb/client');
   const db = await openDatabase();
   const connection = db.connect();
   try {
     connection.query("CREATE TABLE people(id BIGINT, name VARCHAR); INSERT INTO people VALUES (1, 'Orchid'), (2, NULL)");
     const compiler = new Compiler();
     const result = await compiler.query(request, arrowEngine(connection));
-    for await (const batch of batches(result)) console.log(`${batch.numRows} rows`, batch.schema.fields.map(f=>f.name));
+    const rows = [];
+    for await (const batch of batches(result)) {
+      for (let i = 0; i < batch.numRows; i++) rows.push([batch.getChild('id').get(i), batch.getChild('name').get(i)]);
+    }
+    assert.deepEqual(rows, [[1n, 'Orchid'], [2n, null]]);
+    assert.equal(connection.query('SELECT 42 AS n').getChild('n').get(0), 42);
+    console.log(rows);
   } finally { connection.close(); db.reset(); }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
