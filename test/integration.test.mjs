@@ -60,3 +60,16 @@ test('integer parameters preserve signed int64 exactly through compiler and Duck
     }
   } finally { connection.close(); db.reset(); }
 });
+
+test('RDF rules query application columns without a type root', async () => {
+  const db = await openDatabase(); const connection = db.connect();
+  try {
+    connection.query("CREATE TABLE people(id BIGINT, name VARCHAR); INSERT INTO people VALUES (1, 'Ada')");
+    const compiler = new Compiler();
+    const plan = compiler.compile({...request, language: 'sparql', query: 'SELECT ?name WHERE {?s <urn:name> ?name}', rdf: [{
+      table: 'people', subject: {kind: 'template', prefix: 'urn:person:', columns: ['id']},
+      predicate: {kind: 'constant', value: 'urn:name'}, object: {kind: 'literal', column: 'name'}
+    }]});
+    assert.equal(connection.query(plan.sql).getChild('?name').get(0), 'Ada');
+  } finally { connection.close(); db.reset(); }
+});

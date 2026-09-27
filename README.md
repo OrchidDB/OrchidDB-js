@@ -45,3 +45,9 @@ See [the runnable DuckDB-Wasm example](examples/duckdb-wasm.mjs), also exercised
 ## Release
 
 Commit the native source SHA in `NATIVE_REVISION`, update the package version, and tag `vX.Y.Z`. The release workflow builds that exact native source, tests the package, uploads GitHub tarballs and can publish to npm with `NPM_TOKEN` in the `npm` environment. npm scope ownership must be configured by the organization. No credentials or placeholder binaries are included. License: [existing OrchidDB GPL-3.0-only license](LICENSE.md).
+
+SPARQL compile requests accept `rdf: RdfMapping[]` and an optional `dataset`.
+Rules map subjects, predicates, objects, and graphs to the registered application
+tables; `RdfTermMapping` provides typed column, template, blank, literal, and
+constant constructors. No RDF storage table is required. Use a native compiler
+built with the shared RDF mapping API for these requests.

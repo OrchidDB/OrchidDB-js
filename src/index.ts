@@ -17,12 +17,23 @@ export interface Ontology {
   properties?: readonly { iri: string; label: string; property: string }[];
   relationships?: readonly { iri: string; label: string; source_label: string; target_label: string }[];
 }
+export type RdfTermMapping =
+  | { kind: 'iri'; column: string }
+  | { kind: 'template'; prefix: string; columns: readonly string[] }
+  | { kind: 'blank'; scope: string; columns: readonly string[] }
+  | { kind: 'literal'; column: string; datatype?: string; language?: string; language_column?: string }
+  | { kind: 'constant'; value: string; datatype?: string; language?: string };
+export interface RdfMapping {
+  table: string; subject: RdfTermMapping; predicate: RdfTermMapping; object: RdfTermMapping;
+  graph?: RdfTermMapping; dataset?: string; key?: readonly string[]; writable?: boolean;
+}
 /** Only metadata crosses FFI. Result data never enters the compiler. */
 export interface CompileRequest {
   version: 1; dialect: Dialect; language: Language; query: string;
   parameters?: Readonly<Record<string, unknown>>;
-  tables: readonly Table[]; nodes: readonly NodeMapping[]; edges?: readonly EdgeMapping[];
+  tables: readonly Table[]; nodes?: readonly NodeMapping[]; edges?: readonly EdgeMapping[];
   functions?: readonly FunctionSignature[]; ontology?: Ontology;
+  rdf?: readonly RdfMapping[]; dataset?: string;
 }
 export interface CompiledQuery { version: 1; dialect: Dialect; sql: string; fields: readonly string[] }
 
