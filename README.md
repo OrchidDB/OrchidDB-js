@@ -1,6 +1,6 @@
 # OrchidDB for JavaScript and TypeScript
 
-Compile Cypher, Gremlin text, or SPARQL to SQL. Execute on your own database and consume Apache Arrow record batches. No database is bundled; no result rows pass through the Rust compiler.
+Compile Cypher, Gremlin text, or SPARQL to SQL. Execute on your own database and consume Apache Arrow record batches. No database is bundled; query results remain with your application; explicit statistics generation sends bounded samples to shared Rust code.
 
 ```sh
 npm install @orchiddb/client@0.1.0 apache-arrow@17
@@ -51,3 +51,41 @@ Rules map subjects, predicates, objects, and graphs to the registered applicatio
 tables; `RdfTermMapping` provides typed column, template, blank, literal, and
 constant constructors. No RDF storage table is required. Use a native compiler
 built with the shared RDF mapping API for these requests.
+
+## Generate statistics once
+
+```js
+import { Compiler, asyncDuckDBEngine } from '@orchiddb/client';
+const compiler = new Compiler();
+const engine = asyncDuckDBEngine(connection); // worker-backed AsyncDuckDB connection
+const analysis = await compiler.generateStatistics(request, engine);
+console.log(analysis.report);
+const plan = compiler.compile(request);       // automatically uses retained catalog
+console.log(plan.representation_selections);  // full diagnostics are preserved
+compiler.saveStatistics('statistics.json');
+compiler.clearStatistics();
+compiler.loadStatistics('statistics.json');
+compiler.close();                            // release catalog, not database session
+```
+
+One explicit operation can issue multiple bounded database reads. Shared Rust
+code plans collection, computes statistics, and selects cheaper equivalent
+sources. The client transfers Arrow IPC batches and retains a native catalog
+handle, avoiding snapshot serialization on every compile. The same catalog is
+used for Cypher, Gremlin, and SPARQL. No tiers, background refreshes, or optimizer
+modes are exposed. Regenerate explicitly after data changes; mapping identity
+is validated by the shared implementation.
+
+Custom `ExecutionEngine` adapters provide `executeStatistics(task, signal)`.
+They must enforce cancellation and deadlines while obtaining and reading the
+result. `asyncDuckDBEngine` adapts a worker-backed DuckDB-WASM connection and
+cancels its active stream on abort. The blocking WASM example cannot enforce
+wall-clock cancellation, so its adapter intentionally reports unsupported
+statistics execution instead of running an unbounded fallback. Normal queries
+remain supported. Coverage reports include collection errors and skipped work.
+The driver caps submitted rows/bytes and closes leases on every path.
+
+`statisticsCommand(command)` exposes the same coordinator protocol for
+application-owned sessions. `saveStatistics`/`loadStatistics` persist portable
+snapshots. Retain one compiler per independently analyzed mapping; `close`
+releases its catalog. `apache-arrow` is required when generating statistics.

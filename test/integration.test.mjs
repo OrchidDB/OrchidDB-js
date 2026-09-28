@@ -73,3 +73,39 @@ test('RDF rules query application columns without a type root', async () => {
     assert.equal(connection.query(plan.sql).getChild('?name').get(0), 'Ada');
   } finally { connection.close(); db.reset(); }
 });
+
+test('generate, retain, save/load and compile statistics with actual async DuckDB', async () => {
+  const {openAsyncDatabase} = await import('./async-duckdb.mjs');
+  const {asyncDuckDBEngine} = await import('../dist/index.js');
+  const {mkdtempSync, rmSync} = await import('node:fs');
+  const {tmpdir} = await import('node:os');
+  const {join} = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(),'orchiddb-statistics-'));
+  const db = await openAsyncDatabase(); const connection = await db.connect();
+  const compiler = new Compiler();
+  try {
+    await connection.query("CREATE TABLE people(id BIGINT, name VARCHAR); INSERT INTO people VALUES (1, 'Ada'), (2, 'Grace'), (3, NULL)");
+    const engine = asyncDuckDBEngine(connection);
+    const analysis = await compiler.generateStatistics(request, engine);
+    assert.equal(analysis.snapshot.sources.people.sample_rows, 3);
+    assert.equal(analysis.snapshot.sources.people.estimated_rows, 3);
+    for(const [language, query] of [['cypher', "MATCH (p:Person) WHERE p.name = 'Ada' RETURN p.name"], ['gremlin', "g.V().hasLabel('Person').has('name', 'Ada').values('name')"], ['sparql', 'SELECT (42 AS ?answer) WHERE {}']]) {
+      const plan = compiler.compile({...request, language, query});
+      assert.equal(typeof plan.logical_plan, 'string');
+      const result = await engine.execute(plan);
+      let rows = 0; for await(const batch of batches(result)) rows += batch.numRows;
+      assert.equal(rows,1);
+    }
+    compiler.saveStatistics(join(dir,'statistics.json'));
+    compiler.clearStatistics();
+    compiler.loadStatistics(join(dir,'statistics.json'));
+    assert.deepEqual(compiler.statisticsSnapshot, analysis.snapshot);
+    assert.deepEqual(compiler.statisticsReport, analysis.report);
+    assert.ok(compiler.compile(request).sql);
+    await connection.query("CREATE TABLE nested_items AS SELECT 1::BIGINT id, [{'sku':'a','quantity':2::BIGINT},{'sku':'b','quantity':3::BIGINT}] items");
+    const nestedRequest = {...request, nodes:[], tables:[{name:'nested_items', columns:[{name:'id',data_type:'int64'},{name:'items',data_type:'list:struct:{"sku":"string","quantity":"int64"}'}]}]};
+    const nested = await compiler.generateStatistics(nestedRequest, engine);
+    assert.equal(nested.snapshot.sources.nested_items.columns.items.list.observed_elements, 2);
+    assert.equal(nested.snapshot.sources.nested_items.columns.items.list.elements.sku.sample_distinct, 2);
+  } finally {compiler.close(); await connection.close(); await db.terminate(); rmSync(dir,{recursive:true});}
+});
