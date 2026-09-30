@@ -89,3 +89,24 @@ The driver caps submitted rows/bytes and closes leases on every path.
 application-owned sessions. `saveStatistics`/`loadStatistics` persist portable
 snapshots. Retain one compiler per independently analyzed mapping; `close`
 releases its catalog. `apache-arrow` is required when generating statistics.
+
+## Permission pushdown
+
+The compiler accepts a provider-neutral flat effective-grants relation. Node scopes match resource IDs against node source columns, and multiple scopes combine with OR membership filters:
+
+```ts
+import { Compiler, authorization, permissionRelation, permissionScope } from '@orchiddb/client';
+const compiler = new Compiler();
+const direct = permissionRelation('effective_grants', 'document', 'view');
+const project = permissionRelation('effective_grants', 'project', 'view');
+const plan = compiler.compile({
+  ...request,
+  authorization: authorization('user', 'alice'),
+  tables: [...request.tables, { name: 'effective_grants', columns: grantColumns }],
+  nodes: [{ ...request.nodes[0], permission_scopes: [
+    permissionScope('id', direct), permissionScope('project_id', project)
+  ] }]
+});
+```
+
+Include each permission source in `tables`, and map each scope column as a node property. The relation must contain effective grants for the supplied principal; this client does not connect to or synchronize a permission service.

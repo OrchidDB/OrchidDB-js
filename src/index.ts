@@ -9,7 +9,33 @@ export type Dialect = 'duckdb' | 'postgres';
 export type Language = 'cypher' | 'gremlin' | 'sparql';
 export interface Column { name: string; data_type: string; nullable?: boolean }
 export interface Table { name: string; columns: readonly Column[] }
-export interface NodeMapping { label: string; table: string; id: string; properties?: Readonly<Record<string, string>> }
+export interface Authorization { subject_type: string; subject_id: string }
+export interface PermissionRelation {
+  table: string; resource_type: string; permission: string;
+  resource_type_column: string; permission_column: string; resource_id_column: string;
+  subject_type_column: string; subject_relation_column: string; subject_id_column: string;
+}
+export interface PermissionScope { resource_column: string; relation: PermissionRelation }
+export function permissionRelation(table: string, resource_type: string, permission: string,
+  columns: Partial<Omit<PermissionRelation, 'table' | 'resource_type' | 'permission'>> = {}): PermissionRelation {
+  return Object.freeze({table, resource_type, permission,
+    resource_type_column: columns.resource_type_column ?? 'resource_type',
+    permission_column: columns.permission_column ?? 'resource_rel',
+    resource_id_column: columns.resource_id_column ?? 'resource_id',
+    subject_type_column: columns.subject_type_column ?? 'subject_type',
+    subject_relation_column: columns.subject_relation_column ?? 'subject_rel',
+    subject_id_column: columns.subject_id_column ?? 'subject_id'});
+}
+export function permissionScope(resource_column: string, relation: PermissionRelation): PermissionScope {
+  return Object.freeze({resource_column, relation});
+}
+export function authorization(subject_type: string, subject_id: string): Authorization {
+  return Object.freeze({subject_type, subject_id});
+}
+export interface NodeMapping {
+  label: string; table: string; id: string; properties?: Readonly<Record<string, string>>;
+  permission_scopes?: readonly PermissionScope[];
+}
 export interface EdgeMapping extends NodeMapping { source: string; target: string; source_label: string; target_label: string }
 export interface FunctionSignature { name: string; target: string; parameters: readonly string[]; returns: string; aggregate?: boolean }
 export interface Ontology {
@@ -31,6 +57,7 @@ export interface RdfMapping {
 export interface CompileRequest {
   version: 1; dialect: Dialect; language: Language; query: string;
   parameters?: Readonly<Record<string, unknown>>;
+  authorization?: Authorization;
   tables: readonly Table[]; nodes?: readonly NodeMapping[]; edges?: readonly EdgeMapping[];
   functions?: readonly FunctionSignature[]; ontology?: Ontology;
   rdf?: readonly RdfMapping[]; dataset?: string;

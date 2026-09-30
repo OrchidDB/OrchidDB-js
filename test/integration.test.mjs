@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Compiler, batches } from '../dist/index.js';
+import { Compiler, batches, authorization, permissionRelation, permissionScope } from '../dist/index.js';
 import { openDatabase, arrowEngine, request } from '../examples/duckdb-wasm.mjs';
 
 test('native compile -> caller DuckDB -> Arrow preserves values/nulls and transaction ownership', async () => {
@@ -22,6 +22,34 @@ test('native compile -> caller DuckDB -> Arrow preserves values/nulls and transa
     assert.throws(()=>compiler.compile({...request,dialect:'clickhouse'}));
     await assert.rejects(compiler.query(request,{...engine,dialect:'postgres'}),/dialects differ/);
   } finally {connection.close();db.reset();}
+});
+
+test('generic permission scopes authorize direct and project grants before graph query', async () => {
+  const db = await openDatabase(); const connection = db.connect();
+  try {
+    connection.query("CREATE TABLE documents(id BIGINT, project_id BIGINT, title VARCHAR); INSERT INTO documents VALUES (1,10,'direct'),(2,20,'project'),(3,30,'denied')");
+    connection.query("CREATE TABLE effective_grants(resource_type VARCHAR, resource_rel VARCHAR, resource_id VARCHAR, subject_type VARCHAR, subject_rel VARCHAR, subject_id VARCHAR); INSERT INTO effective_grants VALUES ('document','view','1','user','','alice'),('project','view','20','user','','alice'),('project','view','30','user','','bob')");
+    const compiler = new Compiler();
+    const requestWithPermissions = {
+      version: 1, dialect: 'duckdb', language: 'cypher',
+      query: 'MATCH (d:Document) RETURN d.title AS title ORDER BY title',
+      authorization: authorization('user', 'alice'),
+      tables: [
+        {name:'documents', columns:[{name:'id',data_type:'int64'},{name:'project_id',data_type:'int64'},{name:'title',data_type:'string'}]},
+        {name:'effective_grants', columns:[{name:'resource_type',data_type:'string'},{name:'resource_rel',data_type:'string'},{name:'resource_id',data_type:'string'},{name:'subject_type',data_type:'string'},{name:'subject_rel',data_type:'string'},{name:'subject_id',data_type:'string'}]}
+      ],
+      nodes: [{label:'Document',table:'documents',id:'id',properties:{title:'title',project_id:'project_id'},permission_scopes:[
+        permissionScope('id',permissionRelation('effective_grants','document','view')),
+        permissionScope('project_id',permissionRelation('effective_grants','project','view'))
+      ]}]
+    };
+    const engine = arrowEngine(connection);
+    const result = await compiler.query(requestWithPermissions, engine);
+    const rows = [];
+    for await (const batch of batches(result)) for (let i=0;i<batch.numRows;i++) rows.push(batch.getChild('title').get(i));
+    assert.deepEqual(rows, ['direct','project']);
+    assert.throws(() => compiler.compile({...requestWithPermissions, authorization: undefined}), /requires a principal/);
+  } finally { connection.close(); db.reset(); }
 });
 
 test('early stop releases Arrow lease and permits connection reuse', async()=>{
