@@ -8,7 +8,7 @@ import type { RecordBatch, Schema } from 'apache-arrow';
 export type Dialect = 'duckdb' | 'postgres';
 export type Language = 'cypher' | 'gremlin' | 'sparql';
 export interface Column { name: string; data_type: string; nullable?: boolean }
-export interface Table { name: string; columns: readonly Column[] }
+export interface Table { engine?: string; name: string; columns: readonly Column[] }
 export interface Authorization { subject_type: string; subject_id: string }
 export interface PermissionRelation {
   table: string; resource_type: string; permission: string;
@@ -56,6 +56,7 @@ export interface RdfMapping {
 /** Shared compilation metadata and optional generated statistics. */
 export interface CompileRequest {
   version: 1; dialect: Dialect; language: Language; query: string;
+  engines?: Readonly<Record<string, {dialect: Dialect}>>; execution_engine?: string;
   parameters?: Readonly<Record<string, unknown>>;
   authorization?: Authorization;
   tables: readonly Table[]; nodes?: readonly NodeMapping[]; edges?: readonly EdgeMapping[];
@@ -124,6 +125,45 @@ export class Compiler {
     finally { this.freeNative(pointer); }
     if (response?.ok !== true) throw new Error(response?.error ?? 'Invalid compiler response');
     return response.result;
+  }
+  async bindArrow(plan: CompiledQuery, relation: string, source: ArrowResult): Promise<CompiledQuery> {
+    const arrow = await import('apache-arrow');
+    const {Table, tableToIPC, RecordBatch: LocalBatch, Schema, Data} = arrow;
+    // Driver and client may load different Arrow module instances (CJS/ESM).
+    // Normalize metadata, retaining the original value buffers and precision.
+    const field = (f: any): any => new arrow.Field(f.name, type(f.type), f.nullable, f.metadata);
+    const type = (t: any): any => {
+      switch (t.typeId) {
+        case arrow.Type.Null: return new arrow.Null();
+        case arrow.Type.Bool: return new arrow.Bool();
+        case arrow.Type.Int: return new arrow.Int(t.isSigned, t.bitWidth);
+        case arrow.Type.Float: return new arrow.Float(t.precision);
+        case arrow.Type.Utf8: return new arrow.Utf8();
+        case arrow.Type.Binary: return new arrow.Binary();
+        case arrow.Type.Decimal: return new arrow.Decimal(t.scale, t.precision, t.bitWidth);
+        case arrow.Type.Date: return new arrow.Date_(t.unit);
+        case arrow.Type.Time: return new arrow.Time(t.unit, t.bitWidth);
+        case arrow.Type.Timestamp: return new arrow.Timestamp(t.unit, t.timezone);
+        case arrow.Type.Interval: return new arrow.Interval(t.unit);
+        case arrow.Type.Duration: return new arrow.Duration(t.unit);
+        case arrow.Type.List: return new arrow.List(field(t.children[0]));
+        case arrow.Type.Struct: return new arrow.Struct(t.children.map(field));
+        case arrow.Type.FixedSizeList: return new arrow.FixedSizeList(t.listSize, field(t.children[0]));
+        case arrow.Type.FixedSizeBinary: return new arrow.FixedSizeBinary(t.byteWidth);
+        case arrow.Type.Dictionary: return new arrow.Dictionary(type(t.dictionary), type(t.indices), t.id, t.isOrdered);
+        default: throw new Error(`Unsupported Arrow exchange type: ${t}`);
+      }
+    };
+    const normalizeData = (d: any): any => new Data(type(d.type), d.offset, d.length, d.nullCount,
+      d.buffers, d.children.map(normalizeData), d.dictionary ? new arrow.Vector(d.dictionary.data.map(normalizeData)) : undefined);
+    const collected: RecordBatch[] = [];
+    for await (const batch of source) {
+      collected.push(new LocalBatch(new Schema(batch.schema.fields.map(field), batch.schema.metadata), normalizeData(batch.data)));
+    }
+    const data = collected.length
+      ? {ipc: Buffer.from(tableToIPC(new Table(collected), 'stream')).toString('base64')}
+      : {rows: []};
+    return this.callNative(this.compileNative, {op: 'bind', plan, relation, ...data});
   }
   statisticsCommand(command: unknown): any { return this.callNative(this.statisticsNative, command); }
   compile(request: CompileRequest): CompiledQuery {
@@ -220,7 +260,9 @@ export class Compiler {
   }
   async query(request: CompileRequest, engine: ExecutionEngine): Promise<ArrowResult> {
     if (request.dialect !== engine.dialect) throw new Error('Compiler and engine SQL dialects differ');
-    return engine.execute(this.compile(request));
+    const plan = this.compile(request);
+    if ((plan.transfers as unknown[] | undefined)?.length) throw new Error("Use queryFederated for a multi-engine plan");
+    return engine.execute(plan);
   }
 }
 function defaultLibrary(): string {
@@ -342,4 +384,32 @@ function localArrowBatch(batch: any, a: typeof import('apache-arrow')): RecordBa
   const data = (d: any): import('apache-arrow').Data => new a.Data(type(d.type), d.offset, d.length, d.nullCount,
     d.buffers, d.children.map(data), d.dictionary ? new a.Vector(d.dictionary.data.map(data)) : undefined);
   return new a.RecordBatch(new a.Schema(batch.schema.fields.map(field), batch.schema.metadata), data(batch.data) as import('apache-arrow').Data<import('apache-arrow').Struct>);
+}
+
+export interface TransferColumn { name: string; data_type: string; nullable: boolean }
+export interface SqlTransfer {
+  source_engine: string; source_dialect: Dialect; sql: string;
+  target_relation: string; columns: readonly TransferColumn[];
+}
+/** Existing read adapters execute both source islands and the bound final query. */
+export type FederatedEngine = ExecutionEngine;
+
+export async function queryFederated<T>(compiler: Compiler, request: CompileRequest,
+    engines: ReadonlyMap<string, ExecutionEngine>, consume: (result: ArrowResult) => Promise<T>): Promise<T> {
+  let plan = compiler.compile(request);
+  const targetId = plan.execution_engine as string | undefined;
+  if (!targetId) throw new Error('Federated execution requires execution_engine');
+  const transfers = (plan.transfers ?? []) as readonly SqlTransfer[];
+  const routes: [string, Dialect][] = [[targetId, plan.dialect], ...transfers.map(t => [t.source_engine, t.source_dialect] as [string, Dialect])];
+  for (const [id, dialect] of routes) {
+    if (engines.get(id)?.dialect !== dialect) throw new Error(`Missing engine or dialect mismatch: ${id}`);
+  }
+  for (const transfer of transfers) {
+    const source = await engines.get(transfer.source_engine)!.execute({version: 1,
+      dialect: transfer.source_dialect, sql: transfer.sql, fields: transfer.columns.map(c => c.name), field_types: transfer.columns.map(c => c.data_type)});
+    try { plan = await compiler.bindArrow(plan, transfer.target_relation, source); }
+    finally { await source.close(); }
+  }
+  const result = await engines.get(targetId)!.execute(plan);
+  try { return await consume(result); } finally { await result.close(); }
 }
