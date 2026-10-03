@@ -1,6 +1,6 @@
 {
   "name": "@orchiddb/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Compile graph queries to SQL and consume caller-owned Arrow batches",
   "type": "module",
   "main": "./dist/index.js",
