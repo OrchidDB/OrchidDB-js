@@ -34,7 +34,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: {node-version: '22'}
       - uses: dtolnay/rust-toolchain@stable
+        if: inputs.native_run_id == ''
       - uses: Swatinem/rust-cache@v2
+        if: inputs.native_run_id == ''
         with:
           workspaces: .native-build/orchiddb-native
       - run: npm ci
