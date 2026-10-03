@@ -1,9 +1,129 @@
 name: Build and release
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && '[{"os":"ubuntu-22.04"},{"os":"macos-14"},{"os":"macos-15-intel"}]'
+          || '[{"os":"ubuntu-22.04"}]') }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_JOBS: '2'
+    steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Require shared compiler artifacts
+      shell: bash
+      env:
+        NATIVE_RUNS: ${{ inputs.native_runs }}
+        NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+      run: python -c 'import os; assert os.environ["NATIVE_RUNS"] != "{}" or os.environ["NATIVE_RUN_ID"], "Build the shared compiler once before
+        packaging clients"'
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - run: npm ci
+    - name: Download and verify the pinned platform compiler
+      env:
+        GH_TOKEN: ${{ github.token }}
+        NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+        NATIVE_RUNS: ${{ inputs.native_runs }}
+      shell: bash
+      run: |
+        python - <<'PYTHON'
+        import hashlib, json, os, platform, shutil, subprocess, sys, tarfile
+        from pathlib import Path
+        targets = {('Linux','x86_64'): ('x86_64-unknown-linux-gnu','liborchiddb_compiler.so'), ('Darwin','arm64'): ('aarch64-apple-darwin','liborchiddb_compiler.dylib'), ('Darwin','x86_64'): ('x86_64-apple-darwin','liborchiddb_compiler.dylib'), ('Windows','AMD64'): ('x86_64-pc-windows-msvc','orchiddb_compiler.dll')}
+        target, library = targets[(platform.system(), platform.machine())]
+        platform_name = {('Linux','x86_64'):'linux-x86_64', ('Darwin','arm64'):'macos-aarch64', ('Darwin','x86_64'):'macos-x86_64', ('Windows','AMD64'):'windows-x86_64'}[(platform.system(), platform.machine())]
+        os.environ['NATIVE_RUN_ID'] = str(json.loads(os.environ['NATIVE_RUNS']).get(platform_name) or os.environ['NATIVE_RUN_ID'])
+        assert os.environ['NATIVE_RUN_ID'].isdigit(), 'Missing shared compiler run for '+platform_name
+        run = json.loads(subprocess.check_output(['gh','api','repos/OrchidDB/OrchidDB-native/actions/runs/'+os.environ['NATIVE_RUN_ID']], text=True))
+        pin = Path('NATIVE_REVISION').read_text().strip()
+        subprocess.run(['gh','run','download',os.environ['NATIVE_RUN_ID'],'--repo','OrchidDB/OrchidDB-native','--name','compiler-'+target,'--dir','.verified-native'],check=True)
+        source = Path('.verified-native/SOURCE_COMMIT')
+        assert (source.read_text().strip() if source.exists() else run['head_sha']) == pin, 'Compiler source does not match NATIVE_REVISION'
+        archives = list(Path('.verified-native').glob('*.tar.gz'))
+        assert len(archives) == 1
+        with tarfile.open(archives[0]) as tar:
+            metadata = json.load(tar.extractfile('manifest.json'))
+            binary = tar.extractfile(metadata['library']).read()
+        assert metadata['target'] == target
+        assert hashlib.sha256(binary).hexdigest() == metadata['sha256']
+        if Path('CORE_REVISION').exists():
+            assert metadata['core_revision'] == Path('CORE_REVISION').read_text().strip()
+        Path('.verified-native/lib').mkdir(exist_ok=True)
+        Path('.verified-native/lib',library).write_bytes(binary)
+        with open(os.environ['GITHUB_ENV'],'a') as env:
+            env.write('VERIFIED_LIBRARY='+Path('.verified-native/lib',library).resolve().as_posix()+'\n')
+            env.write('VERIFIED_CORE='+metadata['core_revision']+'\n')
+        PYTHON
+    - name: Stage verified compiler
+      run: node scripts/stage-native.mjs "$PWD/.verified-native/lib" "$VERIFIED_CORE"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: native-${{ matrix.os }}
+        path: native/
+        overwrite: true
+  package:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: native-*
+        path: native/
+        merge-multiple: true
+    - run: npm ci
+    - run: npm pack
+    - name: Record source revision
+      shell: bash
+      run: git rev-parse HEAD > SOURCE_COMMIT
+    - uses: actions/upload-artifact@v4
+      with:
+        name: npm-package
+        path: |-
+          *.tgz
+          SOURCE_COMMIT
+        overwrite: true
+  npm-publish:
+    if: inputs.publish_npm
+    needs: package
+    runs-on: ubuntu-22.04
+    environment: npm
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.tag || github.ref }}
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        registry-url: https://registry.npmjs.org
+    - name: Validate publication tag
+      env:
+        RELEASE_TAG: ${{ inputs.tag }}
+      run: test "$RELEASE_TAG" = "v$(node -p 'require("./package.json").version')"
+    - uses: actions/download-artifact@v4
+      with:
+        name: npm-package
+        path: packages
+    - run: npm publish packages/*.tgz --access public
+      env:
+        NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+run-name: orchiddb-js ${{ inputs.request_id }} ${{ inputs.tag }}
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
   workflow_dispatch:
     inputs:
       tag:
@@ -17,118 +137,11 @@ on:
       publish_npm:
         type: boolean
         default: false
-permissions:
-  contents: read
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include: ${{ fromJSON((startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch') && '[{"os":"ubuntu-22.04"},{"os":"macos-14"},{"os":"macos-15-intel"}]' || '[{"os":"ubuntu-22.04"}]') }}
-    runs-on: ${{ matrix.os }}
-    env:
-      CARGO_BUILD_JOBS: '2'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/setup-node@v4
-        with: {node-version: '22'}
-      - uses: dtolnay/rust-toolchain@stable
-        if: inputs.native_run_id == ''
-      - uses: Swatinem/rust-cache@v2
-        if: inputs.native_run_id == ''
-        with:
-          workspaces: .native-build/orchiddb-native
-      - run: npm ci
-      - uses: actions/setup-python@v5
-        with: {python-version: '3.12'}
-      - name: Download and verify the pinned platform compiler
-        if: inputs.native_run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
-        shell: bash
-        run: |
-          python - <<'PYTHON'
-          import hashlib, json, os, platform, shutil, subprocess, sys, tarfile
-          from pathlib import Path
-          targets = {('Linux','x86_64'): ('x86_64-unknown-linux-gnu','liborchiddb_compiler.so'), ('Darwin','arm64'): ('aarch64-apple-darwin','liborchiddb_compiler.dylib'), ('Darwin','x86_64'): ('x86_64-apple-darwin','liborchiddb_compiler.dylib'), ('Windows','AMD64'): ('x86_64-pc-windows-msvc','orchiddb_compiler.dll')}
-          target, library = targets[(platform.system(), platform.machine())]
-          run = json.loads(subprocess.check_output(['gh','api','repos/OrchidDB/OrchidDB-native/actions/runs/'+os.environ['NATIVE_RUN_ID']], text=True))
-          pin = Path('NATIVE_REVISION').read_text().strip()
-          subprocess.run(['gh','run','download',os.environ['NATIVE_RUN_ID'],'--repo','OrchidDB/OrchidDB-native','--name','compiler-'+target,'--dir','.verified-native'],check=True)
-          source = Path('.verified-native/SOURCE_COMMIT')
-          assert (source.read_text().strip() if source.exists() else run['head_sha']) == pin, 'Compiler source does not match NATIVE_REVISION'
-          archives = list(Path('.verified-native').glob('*.tar.gz'))
-          assert len(archives) == 1
-          with tarfile.open(archives[0]) as tar:
-              metadata = json.load(tar.extractfile('manifest.json'))
-              binary = tar.extractfile(metadata['library']).read()
-          assert metadata['target'] == target
-          assert hashlib.sha256(binary).hexdigest() == metadata['sha256']
-          if Path('CORE_REVISION').exists():
-              assert metadata['core_revision'] == Path('CORE_REVISION').read_text().strip()
-          Path('.verified-native/lib').mkdir(exist_ok=True)
-          Path('.verified-native/lib',library).write_bytes(binary)
-          with open(os.environ['GITHUB_ENV'],'a') as env:
-              env.write('VERIFIED_LIBRARY='+Path('.verified-native/lib',library).resolve().as_posix()+'\n')
-              env.write('VERIFIED_CORE='+metadata['core_revision']+'\n')
-          PYTHON
-      - run: ./scripts/build-native.sh
-        if: inputs.native_run_id == ''
-      - name: Stage verified compiler
-        if: inputs.native_run_id != ''
-        run: node scripts/stage-native.mjs "$PWD/.verified-native/lib" "$VERIFIED_CORE"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-${{ matrix.os }}
-          path: native/
-  package:
-    needs: build
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/setup-node@v4
-        with: {node-version: '22'}
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: native-*
-          path: native/
-          merge-multiple: true
-      - run: npm ci
-      - run: npm pack
-      - uses: actions/upload-artifact@v4
-        with: {name: npm-package, path: '*.tgz'}
-  github-release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: package
-    runs-on: ubuntu-22.04
-    permissions: {contents: write}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-      - run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
-      - uses: actions/download-artifact@v4
-        with: {name: npm-package, path: packages}
-      - run: gh release create "$GITHUB_REF_NAME" packages/*.tgz --draft --generate-notes
-        env: {GH_TOKEN: '${{ github.token }}'}
-  npm-publish:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish_npm && startsWith(github.ref, 'refs/tags/v')
-    needs: package
-    runs-on: ubuntu-22.04
-    environment: npm
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
-      - uses: actions/setup-node@v4
-        with: {node-version: '22', registry-url: 'https://registry.npmjs.org'}
-      - run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
-      - uses: actions/download-artifact@v4
-        with: {name: npm-package, path: packages}
-      - run: npm publish packages/*.tgz --access public
-        env: {NODE_AUTH_TOKEN: '${{ secrets.NPM_TOKEN }}'}
+      native_runs:
+        description: Platform to shared-native build run ID JSON map
+        type: string
+        default: '{}'
+      request_id:
+        description: Coordinator request ID
+        type: string
+        default: ''
